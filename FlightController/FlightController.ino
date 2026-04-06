@@ -38,6 +38,7 @@
 #define THROTTLE_IN_PIN 3 
 #define PITCH_IN_PIN 4 
 #define ROLL_IN_PIN 5 
+#define YAW_IN_PIN 6
 
 #define MOTORTL_OUT_PIN 8
 #define MOTORTR_OUT_PIN 9
@@ -48,12 +49,13 @@
 #define ARM_THRESHOLD 1100  // PWM for stick arming logic
 
 // Variables
-uint16_t unThrottleIn, unPitchIn, unRollIn;
+uint16_t unThrottleIn, unPitchIn, unRollIn, unYawIn;
 int outputTL, outputTR, outputBR, outputBL;
 float mpuYaw, mpuPitch, mpuRoll;
 
 bool isArmed = false;
 uint32_t armTimer = 0;
+bool stickReleasedAfterToggle = true;
 int powerTimeout = 0;
 int motorGain = 40;
 
@@ -64,19 +66,23 @@ double PitchconsKp=0.20, PitchconsKi=0.01, PitchconsKd=0.02;
 double RollaggKp=0.15, RollaggKi=0.01, RollaggKd=0.05;
 double RollconsKp=0.20, RollconsKi=0.01, RollconsKd=0.02;
 
+double YawKp=0.30, YawKi=0.0, YawKd=0.05;
+
 double pitchSetpoint, pitchInput, pitchOutput;
 double rollSetpoint, rollInput, rollOutput;
+double yawSetpoint, yawInput, yawOutput;
 
 // Objects
 PID pitchPID(&pitchInput, &pitchOutput, &pitchSetpoint, PitchconsKp, PitchconsKi, PitchconsKd, DIRECT);
 PID rollPID(&rollInput, &rollOutput, &rollSetpoint, RollconsKp, RollconsKi, RollconsKd, DIRECT);
+PID yawPID(&yawInput, &yawOutput, &yawSetpoint, YawKp, YawKi, YawKd, DIRECT);
 MPU6050 mpu;
 Servo servoTL, servoTR, servoBR, servoBL;
 
 // ISR Shared Variables
 volatile uint8_t bUpdateFlagsShared;
-volatile uint16_t unThrottleInShared, unPitchInShared, unRollInShared;
-uint32_t ulThrottleStart, ulPitchStart, ulRollStart;
+volatile uint16_t unThrottleInShared, unPitchInShared, unRollInShared, unYawInShared;
+uint32_t ulThrottleStart, ulPitchStart, ulRollStart, ulYawStart;
 
 // MPU Control
 bool dmpReady = false;
@@ -93,11 +99,13 @@ void setup() {
   Serial.begin(115200);
   
   // PID Init
-  pitchInput = rollInput = 0;
+  pitchInput = rollInput = yawInput = 0;
   pitchPID.SetMode(AUTOMATIC);
   rollPID.SetMode(AUTOMATIC);
+  yawPID.SetMode(AUTOMATIC);
   pitchPID.SetOutputLimits(-OUTPUT_LIMITS, OUTPUT_LIMITS);
   rollPID.SetOutputLimits(-OUTPUT_LIMITS, OUTPUT_LIMITS);
+  yawPID.SetOutputLimits(-OUTPUT_LIMITS, OUTPUT_LIMITS);
 
   // I2C Init
   #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
@@ -116,6 +124,7 @@ void setup() {
   PCintPort::attachInterrupt(THROTTLE_IN_PIN, calcThrottle, CHANGE); 
   PCintPort::attachInterrupt(PITCH_IN_PIN, calcPitch, CHANGE);
   PCintPort::attachInterrupt(ROLL_IN_PIN, calcRoll, CHANGE);
+  PCintPort::attachInterrupt(YAW_IN_PIN, calcYaw, CHANGE);
 
   // MPU Init
   mpu.initialize();
@@ -148,6 +157,7 @@ void loop() {
       mpu.dmpGetQuaternion(&q, fifoBuffer);
       mpu.dmpGetGravity(&gravity, &q);
       mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+      mpuYaw = ypr[0] * 180/M_PI;
       mpuRoll = ypr[1] * 180/M_PI;
       mpuPitch = ypr[2] * 180/M_PI;
   }
@@ -160,6 +170,7 @@ void loop() {
     unThrottleIn = unThrottleInShared;
     unPitchIn = unPitchInShared;
     unRollIn = unRollInShared;
+    unYawIn = unYawInShared;
     bUpdateFlagsShared = 0;
     interrupts();
     powerTimeout = 0;
@@ -174,18 +185,30 @@ void loop() {
     return;
   }
 
-  // 3. Arming Logic (Corner Sticks: Throttle Low, Pitch/Roll Low Left)
-  if (!isArmed) {
-      if (unThrottleIn < 1100 && unPitchIn < 1100 && unRollIn < 1100) {
+  // 3. Arming/Disarming Logic (Sticks Inwards and Down)
+  // Left Stick: Throttle Low (<1100), Yaw Right (>1900)
+  // Right Stick: Pitch Low (<1100), Roll Left (<1100)
+  if (unThrottleIn < ARM_THRESHOLD && unYawIn > 1900 && unPitchIn < ARM_THRESHOLD && unRollIn < ARM_THRESHOLD) {
+      if (stickReleasedAfterToggle) {
           if (armTimer == 0) armTimer = millis();
           if (millis() - armTimer > 2000) {
-              isArmed = true;
-              Serial.println("ARMED!");
+              isArmed = !isArmed;
+              if (isArmed) Serial.println("ARMED!");
+              else {
+                  Serial.println("DISARMED!");
+                  stopMotors();
+              }
+              stickReleasedAfterToggle = false;
           }
-      } else {
-          armTimer = 0;
       }
+  } else {
+      armTimer = 0;
+      stickReleasedAfterToggle = true;
+  }
+
+  if (!isArmed) {
       stopMotors();
+      return;
   }
 
   // 4. PID Computation
@@ -202,12 +225,17 @@ void loop() {
       rollPID.SetTunings(rGap < 5 ? RollconsKp : RollaggKp, rGap < 5 ? RollconsKi : RollaggKi, rGap < 5 ? RollconsKd : RollaggKd);
       rollPID.Compute();
 
-      // 5. Motor Mixing
+      yawInput = mpuYaw;
+      yawSetpoint = map(unYawIn, 1000, 2000, -180, 180); // Caution: MPU Yaw is absolute
+      yawPID.Compute();
+
+      // 5. Motor Mixing (X Config)
+      // TL (CW), TR (CCW), BL (CCW), BR (CW)
       if (unThrottleIn > 1050) {
-          outputTL = unThrottleIn + pitchOutput + rollOutput + motorGain;
-          outputTR = unThrottleIn + pitchOutput - rollOutput + motorGain;
-          outputBL = unThrottleIn - pitchOutput + rollOutput + motorGain;
-          outputBR = unThrottleIn - pitchOutput - rollOutput + motorGain;
+          outputTL = unThrottleIn + pitchOutput + rollOutput + yawOutput + motorGain;
+          outputTR = unThrottleIn + pitchOutput - rollOutput - yawOutput + motorGain;
+          outputBL = unThrottleIn - pitchOutput + rollOutput - yawOutput + motorGain;
+          outputBR = unThrottleIn - pitchOutput - rollOutput + yawOutput + motorGain;
           
           // Safety Clamping
           outputTL = constrain(outputTL, 1000, 2000);
@@ -229,6 +257,7 @@ void loop() {
 void calcThrottle() { if(digitalRead(THROTTLE_IN_PIN) == HIGH) ulThrottleStart = micros(); else { unThrottleInShared = (uint16_t)(micros() - ulThrottleStart); bUpdateFlagsShared |= 1; } }
 void calcPitch() { if(digitalRead(PITCH_IN_PIN) == HIGH) ulPitchStart = micros(); else { unPitchInShared = (uint16_t)(micros() - ulPitchStart); bUpdateFlagsShared |= 2; } }
 void calcRoll() { if(digitalRead(ROLL_IN_PIN) == HIGH) ulRollStart = micros(); else { unRollInShared = (uint16_t)(micros() - ulRollStart); bUpdateFlagsShared |= 4; } }
+void calcYaw() { if(digitalRead(YAW_IN_PIN) == HIGH) ulYawStart = micros(); else { unYawInShared = (uint16_t)(micros() - ulYawStart); bUpdateFlagsShared |= 8; } }
 
 void stopMotors() {
   servoTL.writeMicroseconds(1000); servoTR.writeMicroseconds(1000);
